@@ -14,6 +14,11 @@
 @property (weak, nonatomic) IBOutlet UIButton *stopBtn;
 @property (weak, nonatomic) IBOutlet UIButton *pauseBtn;
 @property (weak, nonatomic) IBOutlet UIButton *resumeBtn;
+@property (weak, nonatomic) IBOutlet UILabel *currentTImeLbl;
+@property (weak, nonatomic) IBOutlet UILabel *totalTimeLbl;
+@property (weak, nonatomic) IBOutlet UISlider *processSlider;
+
+@property (nonatomic, assign) BOOL isSlide;
 
 @property (nonatomic, strong) AVDVideoDecoder *decoder;
 @end
@@ -27,7 +32,9 @@
     [self.stopBtn addTarget:self action:@selector(stop) forControlEvents:UIControlEventTouchUpInside];
     [self.pauseBtn addTarget:self action:@selector(pause) forControlEvents:UIControlEventTouchUpInside];
     [self.resumeBtn addTarget:self action:@selector(resume) forControlEvents:UIControlEventTouchUpInside];
-    
+    [self.processSlider addTarget:self action:@selector(startSlide) forControlEvents:UIControlEventTouchDown];
+    [self.processSlider addTarget:self action:@selector(stopSlide) forControlEvents:UIControlEventTouchUpInside];
+    [self.processSlider addTarget:self action:@selector(stopSlide) forControlEvents:UIControlEventTouchUpOutside];
     
     self.decoder = [[AVDVideoDecoder alloc] init];
     self.decoder.delegate = self;
@@ -35,7 +42,13 @@
 
 - (void)start {
     NSString *filePath = [NSBundle.mainBundle pathForResource:@"test_video" ofType:@"mp4"];
-    [self.decoder startDecode:filePath];
+    if ([self.decoder startDecode:filePath]) {
+        self.totalTimeLbl.text = [NSString stringWithFormat:@"%.2f", self.decoder.totalDuration];
+        self.processSlider.minimumValue = 0;
+        self.processSlider.maximumValue = self.decoder.totalDuration;
+        
+        [self updateCurrentTime];
+    }
 }
 
 - (void)stop {
@@ -48,6 +61,21 @@
 
 - (void)resume {
     [self.decoder resumeDecode];
+}
+     
+- (void)startSlide {
+    [self pause];
+}
+
+- (void)stopSlide {
+    [self resume];
+    NSTimeInterval timestamp = self.processSlider.value;
+    [self.decoder seekTo:timestamp];
+}
+
+- (void)updateCurrentTime {
+    self.currentTImeLbl.text = [NSString stringWithFormat:@"%.2f", self.decoder.currentTime];
+    self.processSlider.value = self.decoder.currentTime;
 }
 
 - (void)showPixel:(CVPixelBufferRef)pixel {
@@ -67,7 +95,8 @@
     NSLog(@"onDecodeError");
 }
 
-- (void)onDecodeVideoFrame:(nonnull CVPixelBufferRef)pixelBuffer {
+- (void)onDecodeVideoFrame:(nonnull CVPixelBufferRef)pixelBuffer timestamp:(NSTimeInterval)timestamp {
+    [self updateCurrentTime];
     [self showPixel:pixelBuffer];
 }
 

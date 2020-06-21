@@ -24,11 +24,13 @@
 }
 
 @property (nonatomic, strong) dispatch_queue_t decodeQueue;
-//@property (nonatomic, strong) dispatch_semaphore_t semaphore;
+
 @property (nonatomic, copy) NSString *filePath;
+@property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) unsigned int countRemaining;
 
-@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, assign) NSTimeInterval currentTime;
+@property (nonatomic, assign) NSTimeInterval totalDuration;
 
 @end
 
@@ -88,6 +90,7 @@
         if (vStream->codec->codec_type == AVMEDIA_TYPE_VIDEO && pCodec == NULL) {
             videoIndex = i;
             pCodecCtx = vStream->codec;
+            self.totalDuration = vStream->duration * 1.f * av_q2d(vStream->time_base);
             break;
         }
     }
@@ -138,18 +141,16 @@
 - (void)readBuffer {
     while (av_read_frame(pFormatCtx, packet) >= 0) {
         if (self.countRemaining == 0 || !self.filePath) {
-            NSLog(@"read frame stop");
             return;
         }
         
         NSLog(@"read frame");
         [self decode];
     }
-    
-    [self teardownDecodeTimer];
-    
+        
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.delegate onDecodeEnd:NO];
+        [self free];
     });
 }
 
@@ -174,8 +175,13 @@
             
             //使用rgb24
             CVPixelBufferCreateWithBytes(nil, pCodecCtx->width, pCodecCtx->height, kCVPixelFormatType_24RGB, pFrameRGB24->data[0], pFrameRGB24->linesize[0], nil, nil, nil, &pixel);
+            
+            NSTimeInterval timestamp = pFrame->pts * 1.0f * av_q2d(vStream->time_base);
+            self.currentTime = timestamp;
+            NSLog(@"decoded frame %p, timestamp:%f", pixel, timestamp);
+            
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self.delegate onDecodeVideoFrame:pixel];
+                [self.delegate onDecodeVideoFrame:pixel timestamp:timestamp];
                 CVPixelBufferRelease(pixel);
             });
             
@@ -245,7 +251,7 @@
 }
 
 - (void)setupDecodeTimer {
-    if (self.timer) {
+    if (self.timer || !self.filePath) {
         return;
     }
     
@@ -257,6 +263,19 @@
     if (self.timer) {
         [self.timer invalidate];
         self.timer = nil;
+    }
+}
+
+- (void)seekTo:(NSTimeInterval)time {
+    if (!self.filePath) {
+        return;
+    }
+    
+    int64_t timestamp = time / av_q2d(vStream->time_base);
+    int ret = av_seek_frame(pFormatCtx, videoIndex, timestamp, AVSEEK_FLAG_BACKWARD);
+    
+    if (ret < 0) {
+        NSLog(@"seek frame failed:%d", ret);
     }
 }
 
