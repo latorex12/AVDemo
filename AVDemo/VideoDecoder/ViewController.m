@@ -8,6 +8,7 @@
 
 #import "ViewController.h"
 #import "AVDVideoDecoder.h"
+#import "AUPlayer.h"
 
 @interface ViewController () <AVDVideoDecoderDelegate>
 @property (weak, nonatomic) IBOutlet UIButton *startBtn;
@@ -21,6 +22,8 @@
 @property (nonatomic, assign) BOOL isSlide;
 
 @property (nonatomic, strong) AVDVideoDecoder *decoder;
+@property (nonatomic, strong) AUPlayer *auPlayer;
+
 @end
 
 @implementation ViewController
@@ -38,17 +41,23 @@
     
     self.decoder = [[AVDVideoDecoder alloc] init];
     self.decoder.delegate = self;
+    
+    self.auPlayer = [[AUPlayer alloc] initWithSampleRate:44100 channel:1 bitPerChannel:16];
 }
 
 - (void)start {
     NSString *filePath = [NSBundle.mainBundle pathForResource:@"test_video" ofType:@"mp4"];
-    if ([self.decoder startDecode:filePath]) {
-        self.totalTimeLbl.text = [NSString stringWithFormat:@"%.2f", self.decoder.totalDuration];
-        self.processSlider.minimumValue = 0;
-        self.processSlider.maximumValue = self.decoder.totalDuration;
-        
-        [self updateCurrentTime];
+    if (![self.decoder startDecode:filePath]) {
+        return;
     }
+    
+    self.totalTimeLbl.text = [NSString stringWithFormat:@"%.2f", self.decoder.totalDuration];
+    self.processSlider.minimumValue = 0;
+    self.processSlider.maximumValue = self.decoder.totalDuration;
+    
+    [self updateCurrentTime];
+    
+    [self.auPlayer start];
 }
 
 - (void)stop {
@@ -98,6 +107,10 @@
 - (void)onDecodeVideoFrame:(nonnull CVPixelBufferRef)pixelBuffer timestamp:(NSTimeInterval)timestamp {
     [self updateCurrentTime];
     [self showPixel:pixelBuffer];
+}
+
+- (void)onDecodeAudioFrame:(void *)data len:(int)len timestamp:(NSTimeInterval)timestamp {
+    [self.auPlayer sendData:data dataLen:len];
 }
 
 - (void)onDecodeEnd:(BOOL)manually {

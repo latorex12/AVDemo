@@ -14,6 +14,7 @@ NS_ASSUME_NONNULL_BEGIN
 @protocol AVDVideoDecoderDelegate <NSObject>
 - (void)onDecodeError;
 - (void)onDecodeVideoFrame:(CVPixelBufferRef)pixelBuffer timestamp:(NSTimeInterval)timestamp;
+- (void)onDecodeAudioFrame:(void *)data len:(int)len timestamp:(NSTimeInterval)timestamp;
 - (void)onDecodeEnd:(BOOL)manually;
 @end
 
@@ -21,6 +22,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, assign, readonly) NSTimeInterval currentTime;
 @property (nonatomic, assign, readonly) NSTimeInterval totalDuration;
+
+@property (nonatomic, assign, readonly) int videoW;
+@property (nonatomic, assign, readonly) int videoH;
 
 @property (nonatomic, weak) id delegate;
 
