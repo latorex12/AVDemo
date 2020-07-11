@@ -7,12 +7,13 @@
 //
 
 #import <Foundation/Foundation.h>
+#import "AVDQueue.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
 //最简单的AudioUnit Player 输入
 @interface AUPlayer : NSObject
-- (instancetype)initWithSampleRate:(int)sampleRate channel:(int)channel bitPerChannel:(int)bitPerChannel;
+- (instancetype)initWithSampleRate:(int)sampleRate channel:(int)channel bitPerChannel:(int)bitPerChannel queue:(AVDQueue *)queue;
 - (void)start;
 - (void)stop;
 - (void)sendData:(void *)data dataLen:(int)dataLen;

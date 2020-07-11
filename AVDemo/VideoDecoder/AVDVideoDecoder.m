@@ -19,25 +19,27 @@
     AVCodecContext *pVCodecCtx, *pACodecCtx;
     AVCodec *pVCodec, *pACodec;
     AVStream *vStream, *aStream;
-    AVFrame *pFrame, *pFrameRGB24, *pAFrame;
+    AVFrame *pFrame, *pFrameRGBA32, *pAFrame;
     struct SwsContext *sws_ctx;
     struct SwrContext *swr_ctx;
     unsigned char *out_buffer, *a_out_buffer;
-    int out_linesize, a_out_buffer_size;
+    int v_out_buffer_size, out_linesize, a_out_buffer_size;
     AVPacket *packet;
 }
 
-@property (nonatomic, strong) dispatch_queue_t decodeQueue;
+@property (nonatomic, strong) NSThread *decodeThread;
 
 @property (nonatomic, copy) NSString *filePath;
-@property (nonatomic, strong) NSTimer *timer;
-@property (nonatomic, assign) unsigned int countRemaining;
+@property (nonatomic, assign) BOOL pause;
 
 @property (nonatomic, assign) NSTimeInterval currentTime;
 @property (nonatomic, assign) NSTimeInterval totalDuration;
 
 @property (nonatomic, assign) int videoW;
 @property (nonatomic, assign) int videoH;
+@property (nonatomic, assign) int lineSize;
+
+@property (nonatomic, assign) BOOL isEOF;
 
 @end
 
@@ -45,35 +47,57 @@
 
 - (void)dealloc {
     [self stopDecode];
+    [self.decodeThread cancel];
 }
 
 - (instancetype)init {
     if (self = [super init]) {
         //注册
         av_register_all();
-        
-        _decodeQueue = dispatch_queue_create("avd_decode", NULL);
-//        _semaphore = dispatch_semaphore_create(1);
+        [self setupDecodeThread];
     }
     return self;
 }
 
-- (BOOL)startDecode:(NSString *)filePath {
+- (void)setupDecodeThread {
+    NSThread *decodeThread = [[NSThread alloc] initWithBlock:^{
+        NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
+        [runLoop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
+        [runLoop run];
+    }];
+    
+    decodeThread.name = @"AVD Decode";
+    [decodeThread start];
+    
+    self.decodeThread = decodeThread;
+}
+
+- (void)startDecode:(NSString *)filePath {
+    if (![NSThread.currentThread isEqual:self.decodeThread]) {
+        [self performSelector:@selector(startDecode:) onThread:self.decodeThread withObject:filePath waitUntilDone:NO];
+        return;
+    }
+    
+    NSLog(@"Decoder start decode:%@", filePath);
+    
     if (self.filePath) {
         printf("⚠️当前正在解码，无法重复解码");
-        return NO;
+        return;
     }
     
     self.filePath = filePath;
-    if (![self prepare]) {
-        [self free];
-        [self.delegate onDecodeError];
-        return NO;
+    
+    @synchronized (self) {
+        if (![self prepare]) {
+            [self free];
+            [self.delegate onDecodeError];
+            return;
+        }
     }
 
-    [self setupDecodeTimer];
+    self.isEOF = NO;
     
-    return YES;
+    [self startParse];
 }
 
 - (BOOL)prepare {
@@ -154,12 +178,12 @@
     packet = av_packet_alloc();
 
     pFrame = av_frame_alloc();
-    pFrameRGB24 = av_frame_alloc();
+    pFrameRGBA32 = av_frame_alloc();
     
-    int numBytes = avpicture_get_size(AV_PIX_FMT_RGB24, pVCodecCtx->width, pVCodecCtx->height);
-    out_buffer = (uint8_t*)av_malloc(numBytes * sizeof(uint8_t));
+    v_out_buffer_size = avpicture_get_size(AV_PIX_FMT_BGRA, pVCodecCtx->width, pVCodecCtx->height);
+    out_buffer = (uint8_t*)av_malloc(v_out_buffer_size * sizeof(uint8_t));
     
-    avpicture_fill((AVPicture*)pFrameRGB24, out_buffer, AV_PIX_FMT_RGB24, pVCodecCtx->width, pVCodecCtx->height);
+    avpicture_fill((AVPicture*)pFrameRGBA32, out_buffer, AV_PIX_FMT_RGB24, pVCodecCtx->width, pVCodecCtx->height);
     
     a_out_buffer_size = av_samples_get_buffer_size(&out_linesize,
                                                      pACodecCtx->channels,
@@ -172,23 +196,19 @@
     ///设置音视频属性
     self.videoW = pVCodecCtx->width;
     self.videoH = pVCodecCtx->height;
+    self.lineSize = pFrameRGBA32->linesize[0];
 
     return YES;
 }
 
-- (void)decodeFrame {
-    @synchronized (self) {
-        self.countRemaining = 1;
-        
-        dispatch_async(self.decodeQueue, ^{
-            [self readBuffer];
-        });
+- (void)startParse {
+    if (self.isEOF) {
+        return;
     }
-}
-
-- (void)readBuffer {
+    
     while (av_read_frame(pFormatCtx, packet) >= 0) {
-        if (self.countRemaining == 0 || !self.filePath) {
+        if (!self.filePath || self.pause) {
+            NSLog(@"Decoder stop decode or paused.");
             return;
         }
         
@@ -196,10 +216,8 @@
         [self decode];
     }
         
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.delegate onDecodeEnd:NO];
-        [self free];
-    });
+    [self.delegate onDecodeEnd:NO];
+    [self free];
 }
 
 - (void)decode {
@@ -212,6 +230,8 @@
 }
 
 - (void)decodeVideo {
+    NSLog(@"Decoder decode video frame");
+    
     int frameFinished = 0;
     //解码
     int r = avcodec_decode_video2(pVCodecCtx, pFrame, &frameFinished, packet);
@@ -219,33 +239,23 @@
     packet->data += r;
     
     if (frameFinished) {
-        sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data, pFrame->linesize, 0, pVCodecCtx->height, pFrameRGB24->data, pFrameRGB24->linesize);
-        
-        //写入pixelBuf
-        CVPixelBufferRef pixel;
-        
-        //直接使用420p
-        //                size_t planeWidth[3] = {pFrame->width, pFrame->width/2, pFrame->width/2};
-        //                size_t planeHeight[3] = {pFrame->height, pFrame->height/2, pFrame->height/2};
-        //                res = CVPixelBufferCreateWithPlanarBytes(nil, pCodecCtx->width, pCodecCtx->height, kCVPixelFormatType_420YpCbCr8Planar, NULL, NULL, 3, pFrame->data, planeWidth, planeHeight, pFrame->linesize, nil, nil, nil, &pixel);
-        
-        //使用rgb24
-        CVPixelBufferCreateWithBytes(nil, pVCodecCtx->width, pVCodecCtx->height, kCVPixelFormatType_24RGB, pFrameRGB24->data[0], pFrameRGB24->linesize[0], nil, nil, nil, &pixel);
+        sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data, pFrame->linesize, 0, pVCodecCtx->height, pFrameRGBA32->data, pFrameRGBA32->linesize);
         
         NSTimeInterval timestamp = pFrame->pts * 1.0f * av_q2d(vStream->time_base);
         self.currentTime = timestamp;
-        NSLog(@"decoded frame %p, timestamp:%f", pixel, timestamp);
         
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self.delegate onDecodeVideoFrame:pixel timestamp:timestamp];
-            CVPixelBufferRelease(pixel);
-        });
+        void *data = malloc(v_out_buffer_size);
+        memcpy(data, out_buffer, v_out_buffer_size);
         
-        self.countRemaining--;
+        NSLog(@"decoded frame %, timestamp:%f", data, timestamp);
+        
+        [self.delegate onDecodeVideoFrame:data len:v_out_buffer_size timestamp:timestamp];
     }
 }
 
 - (void)decodeAudio {
+    NSLog(@"Decoder decode audio frame");
+    
     int gotFrame = 0;
     //解码
     int result = avcodec_decode_audio4(pACodecCtx, pFrame, &gotFrame, packet);
@@ -261,8 +271,11 @@
         return;
     }
     
+    //初始化内存空间
+    void *out_buffer = av_malloc(a_out_buffer_size);
+    
     // 转换
-    int ret = swr_convert(swr_ctx, &a_out_buffer, pFrame->nb_samples*2, (const uint8_t **)pFrame->data , pFrame->nb_samples);
+    int ret = swr_convert(swr_ctx, &out_buffer, pFrame->nb_samples*2, (const uint8_t **)pFrame->data , pFrame->nb_samples);
     
     if (ret < 0) {
         printf("Send audio data to Resample Convertor failed.");
@@ -274,25 +287,24 @@
         return;
     }
     
-    [self.delegate onDecodeAudioFrame:a_out_buffer len:ret*2 timestamp:timestamp];
+    [self.delegate onDecodeAudioFrame:out_buffer len:ret*2 timestamp:timestamp];
 }
 
 - (void)stopDecode {
-    if (!pFormatCtx) {
-        return;
-    }
-    
-    [self free];
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
+    @synchronized (self) {
+        NSLog(@"Decoder stop decode");
+        
+        if (!pFormatCtx) {
+            return;
+        }
+        
+        [self free];
         [self.delegate onDecodeEnd:YES];
-    });
+    }
 }
 
 - (void)free {
     self.filePath = nil;
-    
-    [self teardownDecodeTimer];
     
     if (out_buffer) {
         av_free(out_buffer);
@@ -302,8 +314,8 @@
     if (pFrame) {
         av_frame_free(&pFrame);
     }
-    if (pFrameRGB24) {
-        av_frame_free(&pFrameRGB24);
+    if (pFrameRGBA32) {
+        av_frame_free(&pFrameRGBA32);
     }
     
     if (packet) {
@@ -327,42 +339,48 @@
     
     vStream = NULL;
     pVCodec = NULL;
+    
+    self.isEOF = YES;
 }
 
 - (void)pauseDecode {
-    [self teardownDecodeTimer];
+    @synchronized (self) {
+        NSLog(@"Decoder pause decode");
+        
+        if (!self.filePath) {
+            return;
+        }
+        
+        self.pause = YES;
+    }
 }
 
 - (void)resumeDecode {
-    [self setupDecodeTimer];
-}
-
-- (void)setupDecodeTimer {
-    if (self.timer || !self.filePath) {
-        return;
+    @synchronized (self) {
+        NSLog(@"Decoder resume decode");
+        
+        if (!self.filePath) {
+            return;
+        }
+        
+        self.pause = NO;
     }
     
-    NSTimeInterval timeInterval = 1.f * vStream->avg_frame_rate.den / vStream->avg_frame_rate.num-0.02;
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:timeInterval target:self selector:@selector(decodeFrame) userInfo:nil repeats:YES];
-}
-
-- (void)teardownDecodeTimer {
-    if (self.timer) {
-        [self.timer invalidate];
-        self.timer = nil;
-    }
+    [self performSelector:@selector(startParse) onThread:self.decodeThread withObject:nil waitUntilDone:NO];
 }
 
 - (void)seekTo:(NSTimeInterval)time {
-    if (!self.filePath) {
-        return;
-    }
-    
-    int64_t timestamp = time / av_q2d(vStream->time_base);
-    int ret = av_seek_frame(pFormatCtx, videoIndex, timestamp, AVSEEK_FLAG_BACKWARD);
-    
-    if (ret < 0) {
-        NSLog(@"seek frame failed:%d", ret);
+    @synchronized (self) {
+        if (!self.filePath) {
+            return;
+        }
+        
+        int64_t timestamp = time / av_q2d(vStream->time_base);
+        int ret = av_seek_frame(pFormatCtx, videoIndex, timestamp, AVSEEK_FLAG_BACKWARD);
+        
+        if (ret < 0) {
+            NSLog(@"seek frame failed:%d", ret);
+        }
     }
 }
 

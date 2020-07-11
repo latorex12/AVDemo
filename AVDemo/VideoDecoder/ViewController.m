@@ -9,8 +9,9 @@
 #import "ViewController.h"
 #import "AVDVideoDecoder.h"
 #import "AUPlayer.h"
+#import "AVDQueue.h"
 
-@interface ViewController () <AVDVideoDecoderDelegate>
+@interface ViewController () <AVDVideoDecoderDelegate, AVDQueueDelegate>
 @property (weak, nonatomic) IBOutlet UIButton *startBtn;
 @property (weak, nonatomic) IBOutlet UIButton *stopBtn;
 @property (weak, nonatomic) IBOutlet UIButton *pauseBtn;
@@ -23,6 +24,9 @@
 
 @property (nonatomic, strong) AVDVideoDecoder *decoder;
 @property (nonatomic, strong) AUPlayer *auPlayer;
+
+@property (nonatomic, strong) AVDQueue *aQueue;
+@property (nonatomic, strong) AVDQueue *vQueue;
 
 @end
 
@@ -39,17 +43,19 @@
     [self.processSlider addTarget:self action:@selector(stopSlide) forControlEvents:UIControlEventTouchUpInside];
     [self.processSlider addTarget:self action:@selector(stopSlide) forControlEvents:UIControlEventTouchUpOutside];
     
+    self.aQueue = [[AVDQueue alloc] init];
+    self.aQueue.delegate = self;
+    self.vQueue = [[AVDQueue alloc] init];
+
     self.decoder = [[AVDVideoDecoder alloc] init];
     self.decoder.delegate = self;
     
-    self.auPlayer = [[AUPlayer alloc] initWithSampleRate:44100 channel:1 bitPerChannel:16];
+    self.auPlayer = [[AUPlayer alloc] initWithSampleRate:44100 channel:1 bitPerChannel:16 queue:self.aQueue];
 }
 
 - (void)start {
     NSString *filePath = [NSBundle.mainBundle pathForResource:@"test_video" ofType:@"mp4"];
-    if (![self.decoder startDecode:filePath]) {
-        return;
-    }
+    [self.decoder startDecode:filePath];
     
     self.totalTimeLbl.text = [NSString stringWithFormat:@"%.2f", self.decoder.totalDuration];
     self.processSlider.minimumValue = 0;
@@ -87,6 +93,26 @@
     self.processSlider.value = self.decoder.currentTime;
 }
 
+- (void)renderVideoDataIfNeeded:(NSTimeInterval)audioPts {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AVDQueueNode *node = [self.vQueue firstNode];
+        if (!node || node.pts > audioPts) {
+            return;
+        }
+        
+        NSLog(@"renderVideoDataIfNeeded:%f", node.pts);
+        
+        [self updateCurrentTime];
+        
+        //写入pixelBuf
+        CVPixelBufferRef pixel;
+        CVPixelBufferCreateWithBytes(nil, self.decoder.videoW, self.decoder.videoH, kCVPixelFormatType_24RGB, node.content, self.decoder.lineSize, nil, nil, nil, &pixel);
+        [self showPixel:pixel];
+        
+        [self.vQueue dequeue];
+    });
+}
+
 - (void)showPixel:(CVPixelBufferRef)pixel {
     CIImage *ciImage = [CIImage imageWithCVPixelBuffer:pixel];
     CIContext *temporaryContext = [CIContext contextWithOptions:nil];
@@ -104,18 +130,53 @@
     NSLog(@"onDecodeError");
 }
 
-- (void)onDecodeVideoFrame:(nonnull CVPixelBufferRef)pixelBuffer timestamp:(NSTimeInterval)timestamp {
-    [self updateCurrentTime];
-    [self showPixel:pixelBuffer];
+- (void)onDecodeVideoFrame:(void *)data len:(int)len timestamp:(NSTimeInterval)timestamp {
+    AVDQueueNode *node = [[AVDQueueNode alloc] init];
+    node.pts = timestamp;
+    node.content = data;
+    node.len = len;
+    
+    [self.vQueue enqueue:node];
 }
 
 - (void)onDecodeAudioFrame:(void *)data len:(int)len timestamp:(NSTimeInterval)timestamp {
-    [self.auPlayer sendData:data dataLen:len];
+    AVDQueueNode *node = [[AVDQueueNode alloc] init];
+    node.pts = timestamp;
+    node.content = data;
+    node.len = len;
+    
+    [self.aQueue enqueue:node];
+    
+//    dispatch_async(dispatch_get_main_queue(), ^{
+//        AVDQueueNode *node = [self.aQueue dequeue];
+//        if (!node) {
+//            return;
+//        }
+//
+//        [self.auPlayer sendData:node.content dataLen:node.len];
+        
+//        free(node.content);
+//    });
 }
 
 - (void)onDecodeEnd:(BOOL)manually {
     NSLog(@"onDecodeEnd,manaually:%@", manually ? @"Y":@"N");
     self.view.layer.contents = nil;
+    [self.auPlayer stop];
+}
+
+#pragma mark - AVDQueueDelegate
+
+- (void)bufferStart {
+    [self.decoder resumeDecode];
+}
+
+- (void)bufferEnd {
+    [self.decoder pauseDecode];
+}
+
+- (void)outBufferNode:(AVDQueueNode *)node {
+    [self renderVideoDataIfNeeded:node.pts];//音频驱动视频
 }
 
 @end

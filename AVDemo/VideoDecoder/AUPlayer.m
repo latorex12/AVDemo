@@ -16,20 +16,23 @@
 @property (nonatomic, assign) int bitPerChannel;
 
 @property (nonatomic, assign) AudioUnit audioUnit;
-@property (nonatomic, strong) NSMutableData *data;
 
-@property (nonatomic, strong) NSInputStream *stream;
+@property (nonatomic, strong) dispatch_queue_t playQueue;
+
+@property (nonatomic, strong) AVDQueue *dataQueue;
+@property (nonatomic, strong) NSMutableData *buffer;
 
 @end
 
 @implementation AUPlayer
 
-- (instancetype)initWithSampleRate:(int)sampleRate channel:(int)channel bitPerChannel:(int)bitPerChannel {
+- (instancetype)initWithSampleRate:(int)sampleRate channel:(int)channel bitPerChannel:(int)bitPerChannel queue:(AVDQueue *)queue {
     if (self = [super init]) {
         _sampleRate = sampleRate;
         _channelCount = channel;
         _bitPerChannel = bitPerChannel;
-        _data = [NSMutableData data];
+        _dataQueue = queue;
+        _buffer = [NSMutableData data];
     }
     
     return self;
@@ -113,12 +116,11 @@
 
 - (void)stop {
     AudioOutputUnitStop(_audioUnit);
-    
-    _data.length = 0;
 }
 
 - (void)sendData:(void *)data dataLen:(int)dataLen {
-    [self.data appendBytes:data length:(NSUInteger)dataLen];
+//    [self.queue appendBytes:data length:(NSUInteger)dataLen];
+//    NSLog(@"audio data+%d, remaining:%d",dataLen, self.data.length);
 }
 
 static OSStatus PlayCallback(void *inRefCon,
@@ -127,18 +129,37 @@ static OSStatus PlayCallback(void *inRefCon,
                              UInt32 inBusNumber,
                              UInt32 inNumberFrames,
                              AudioBufferList *ioData) {
-    AUPlayer *player = (__bridge AUPlayer *)(inRefCon);
-    
     AudioBuffer audioBuffer = ioData->mBuffers[0];
-    if (player.data.length >= audioBuffer.mDataByteSize) {
-        NSRange dataRange = NSMakeRange(0, audioBuffer.mDataByteSize);
-        NSData *subData = [player.data subdataWithRange:dataRange];
+    
+    AUPlayer *player = (__bridge AUPlayer *)(inRefCon);
+    NSMutableData *buffer = player.buffer;
+    AVDQueue *dataQueue = player.dataQueue;
+    
+    BOOL playData = NO;
+    if (buffer.length >= audioBuffer.mDataByteSize) {
+        playData = YES;
+    }
+    else if (!dataQueue.isEmpty) {
+        while (dataQueue.isEmpty || buffer.length < audioBuffer.mDataByteSize) {
+            AVDQueueNode *node = [dataQueue dequeue];
+            [buffer appendBytes:node.content length:node.len];
+            
+            NSLog(@"renderAudioData:%f", node.pts);
+        }
         
-        memcpy(audioBuffer.mData, subData.bytes, audioBuffer.mDataByteSize);
+        if (buffer.length > audioBuffer.mDataByteSize) {
+            playData = YES;
+        }
+    }
+    
+    if (playData) {
+        memcpy(audioBuffer.mData, buffer.bytes, audioBuffer.mDataByteSize);
         
-        [player.data replaceBytesInRange:dataRange withBytes:NULL length:0];
+        NSRange range = NSMakeRange(0, audioBuffer.mDataByteSize);
+        [buffer replaceBytesInRange:range withBytes:NULL length:0];
     }
     else {
+        memset(audioBuffer.mData, 0, audioBuffer.mDataByteSize);
         NSLog(@"No Audio Data");
     }
     
